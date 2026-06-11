@@ -1,1 +1,1 @@
-worker: python /app/BuyerSearchUSDTKZTBot/BuyerSearchUSDTKZTBot.py
+worker: python main.py
