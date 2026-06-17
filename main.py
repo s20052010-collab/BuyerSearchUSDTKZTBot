@@ -121,120 +121,38 @@ async def binance_sell(session):
         return None
 
 
-async def bybit_buy(session):
-    url = "https://api2.bybit.com/fiat/otc/item/online"
-    try:
-        async with session.post(url, json={
-            "tokenId": "USDT", "currencyId": "KZT",
-            "side": "1", "page": "1", "size": "20"
-        }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json()
-            best = None
-            for item in data.get("result", {}).get("items", []):
-                price = float(item.get("price", 0))
-                min_l = float(item.get("minAmount", 0))
-                max_l = float(item.get("maxAmount", 0))
-                trades = int(item.get("recentOrderNum", 0))
-                comp_raw = float(item.get("recentExecuteRate", 0))
-                comp = comp_raw * 100 if comp_raw <= 1 else comp_raw
-                nick = item.get("nickName", "?")
-                banks = set()
-                for pm in item.get("payments", []):
-                    name = pm.get("name") or ""
-                    if name:
-                        banks.add(name.strip())
-                if not banks:
-                    for pm in item.get("paymentMethods", []):
-                        if isinstance(pm, str):
-                            banks.add(pm.strip())
-                        elif isinstance(pm, dict):
-                            name = pm.get("name") or pm.get("paymentType") or ""
-                            if name:
-                                banks.add(name.strip())
-                if price <= 0: continue
-                if trades < SELLER_MIN_TRADES: continue
-                if comp < SELLER_MIN_COMPLETION: continue
-                if min_l > SELLER_MIN_LIMIT_KZT: continue
-                if max_l < SELLER_MIN_LIMIT_KZT: continue
-                if not best or price < best[0]:
-                    best = (price, min_l, max_l, banks, nick, trades, round(comp, 1))
-            return best
-    except Exception as e:
-        logger.error(f"Bybit buy error: {e}")
-        return None
+async def scan(session):
+    buy_data, sell_data = await asyncio.gather(
+        binance_buy(session),
+        binance_sell(session)
+    )
 
-
-async def bybit_sell(session):
-    url = "https://api2.bybit.com/fiat/otc/item/online"
-    try:
-        async with session.post(url, json={
-            "tokenId": "USDT", "currencyId": "KZT",
-            "side": "0", "page": "1", "size": "20"
-        }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
-            data = await r.json()
-            best = None
-            for item in data.get("result", {}).get("items", []):
-                price = float(item.get("price", 0))
-                min_l = float(item.get("minAmount", 0))
-                max_l = float(item.get("maxAmount", 0))
-                trades = int(item.get("recentOrderNum", 0))
-                comp_raw = float(item.get("recentExecuteRate", 0))
-                comp = comp_raw * 100 if comp_raw <= 1 else comp_raw
-                nick = item.get("nickName", "?")
-                banks = set()
-                for pm in item.get("payments", []):
-                    name = pm.get("name") or ""
-                    if name:
-                        banks.add(name.strip())
-                if not banks:
-                    for pm in item.get("paymentMethods", []):
-                        if isinstance(pm, str):
-                            banks.add(pm.strip())
-                        elif isinstance(pm, dict):
-                            name = pm.get("name") or pm.get("paymentType") or ""
-                            if name:
-                                banks.add(name.strip())
-                if price <= 0: continue
-                if trades < BUYER_MIN_TRADES: continue
-                if comp < BUYER_MIN_COMPLETION: continue
-                if min_l > BUYER_MAX_MIN_LIMIT_KZT: continue
-                if not best or price > best[0]:
-                    best = (price, min_l, max_l, banks, nick, trades, round(comp, 1))
-            return best
-    except Exception as e:
-        logger.error(f"Bybit sell error: {e}")
-        return None
-
-
-def check_pair(buy_data, sell_data, buy_ex, sell_ex):
     if not buy_data or not sell_data:
-        return None
+        return []
 
     buy_price, buy_min, buy_max, buy_banks, buy_nick, buy_trades, buy_comp = buy_data
     sell_price, sell_min, sell_max, sell_banks, sell_nick, sell_trades, sell_comp = sell_data
 
-    # Одинаковые банки
+    # Общие банки
     common_banks = buy_banks & sell_banks
     if not common_banks:
-        return None
+        logger.info(f"No common banks. Buy: {buy_banks} Sell: {sell_banks}")
+        return []
 
     # Мин сумма продажи не больше макс суммы покупки
     if sell_min > buy_max:
-        return None
+        logger.info(f"Limit mismatch: sell_min={sell_min} > buy_max={buy_max}")
+        return []
 
     net = round(((sell_price - buy_price) / buy_price) * 100 - 0.6, 2)
 
-    # Ключ для защиты от повторов
-    key = f"{buy_ex}-{sell_ex}-{buy_price}-{sell_price}"
+    # Защита от повторов
+    key = f"{buy_price}-{sell_price}-{sorted(common_banks)}"
     if key in SEEN_DEALS:
-        return None
+        return []
     SEEN_DEALS.add(key)
 
-    return {
-        "buy_exchange": buy_ex,
-        "sell_exchange": sell_ex,
+    signal = {
         "buy_price": buy_price,
         "sell_price": sell_price,
         "buy_nick": buy_nick,
@@ -251,28 +169,7 @@ def check_pair(buy_data, sell_data, buy_ex, sell_ex):
         "profitable": net >= MIN_MARGIN
     }
 
-
-async def scan(session):
-    b_buy, b_sell, bb_buy, bb_sell = await asyncio.gather(
-        binance_buy(session),
-        binance_sell(session),
-        bybit_buy(session),
-        bybit_sell(session)
-    )
-
-    signals = []
-
-    # Binance -> Bybit
-    r = check_pair(b_buy, bb_sell, "Binance", "Bybit")
-    if r:
-        signals.append(r)
-
-    # Bybit -> Binance
-    r = check_pair(bb_buy, b_sell, "Bybit", "Binance")
-    if r:
-        signals.append(r)
-
-    return signals
+    return [signal]
 
 
 def format_signal(s):
@@ -281,13 +178,13 @@ def format_signal(s):
     profit_500 = round((s["sell_price"] - s["buy_price"]) * 500 * 0.994, 0)
     icon = "🚨" if s["profitable"] else "📊"
     return (
-        f"{icon} *АРБИТРАЖ: {s['buy_exchange']} → {s['sell_exchange']}*\n"
+        f"{icon} *СИГНАЛ АРБИТРАЖА — Binance KZT*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📥 *КУПИТЬ на {s['buy_exchange']}*\n"
+        f"📥 *КУПИТЬ USDT*\n"
         f"   Цена: `{s['buy_price']} KZT`\n"
         f"   Продавец: {s['buy_nick']}\n"
         f"   ✅ Сделок: {s['buy_trades']} | Рейтинг: {s['buy_comp']}%\n\n"
-        f"📤 *ПРОДАТЬ на {s['sell_exchange']}*\n"
+        f"📤 *ПРОДАТЬ USDT*\n"
         f"   Цена: `{s['sell_price']} KZT`\n"
         f"   Покупатель: {s['sell_nick']}\n"
         f"   ✅ Сделок: {s['sell_trades']} | Рейтинг: {s['sell_comp']}%\n\n"
@@ -301,19 +198,36 @@ def format_signal(s):
     )
 
 
+def filters_text():
+    return (
+        f"⚙️ *ФИЛЬТРЫ*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📥 *ПРОДАВЦЫ* (покупаем USDT):\n"
+        f"   • Сделок: {SELLER_MIN_TRADES}+\n"
+        f"   • Рейтинг: {SELLER_MIN_COMPLETION}%+\n"
+        f"   • Лимит от: {SELLER_MIN_LIMIT_KZT:,} KZT\n\n"
+        f"📤 *ПОКУПАТЕЛИ* (продаём USDT):\n"
+        f"   • Сделок: {BUYER_MIN_TRADES}+\n"
+        f"   • Рейтинг: {BUYER_MIN_COMPLETION}%+\n"
+        f"   • Мин. лимит не выше: {BUYER_MAX_MIN_LIMIT_KZT:,} KZT\n\n"
+        f"📊 Площадка: Binance P2P\n"
+        f"💱 Валюта: KZT\n"
+        f"🏦 Только совпадающие банки\n"
+    )
+
+
 HELP_TEXT = """
-🤖 *ARB BYBIT × BINANCE BOT*
+🤖 *BuyerSearch-USDT-KZT-Bot*
 ━━━━━━━━━━━━━━━━━━━━━━
 
 Команды:
 /start — запустить мониторинг
 /scan — сканировать прямо сейчас
+/filters — текущие фильтры
 /help — помощь
 
-Бот мониторит каждые 5 минут.
-Сигнал когда маржа ≥1%.
-Только совпадающие банки.
-Только Binance ↔ Bybit.
+Бот мониторит Binance P2P каждые 5 минут.
+Сигнал когда маржа ≥1% и банки совпадают.
 """
 
 
@@ -324,15 +238,14 @@ async def handle_command(session, text, chat_id):
 
     if cmd == "/start":
         await send_message(session,
-            "✅ *ArbBybitBinanceBOT запущен!*\n\n"
-            "Мониторю Binance ↔ Bybit P2P каждые 5 минут.\n"
+            "✅ *BuyerSearch-USDT-KZT-Bot запущен!*\n\n"
+            "Мониторю Binance P2P каждые 5 минут.\n"
             "Сигнал когда маржа ≥1% и банки совпадают.\n\n"
-            f"Фильтры продавцов: {SELLER_MIN_TRADES}+ сделок, {SELLER_MIN_COMPLETION}%+, от {SELLER_MIN_LIMIT_KZT:,} KZT\n"
-            f"Фильтры покупателей: {BUYER_MIN_TRADES}+ сделок, {BUYER_MIN_COMPLETION}%+, мин.лимит ≤{BUYER_MAX_MIN_LIMIT_KZT:,} KZT"
+            + filters_text()
         )
 
     elif cmd == "/scan":
-        await send_message(session, "🔍 Сканирую Binance и Bybit...")
+        await send_message(session, "🔍 Сканирую Binance P2P...")
         signals = await scan(session)
         if not signals:
             await send_message(session,
@@ -343,6 +256,9 @@ async def handle_command(session, text, chat_id):
         else:
             for s in signals:
                 await send_message(session, format_signal(s))
+
+    elif cmd == "/filters":
+        await send_message(session, filters_text())
 
     elif cmd == "/help":
         await send_message(session, HELP_TEXT)
@@ -374,7 +290,7 @@ async def monitor_loop(session):
                 if profitable:
                     for s in profitable:
                         await send_message(session, format_signal(s))
-                    logger.info(f"Signals sent: {len(profitable)}")
+                    logger.info(f"Signal sent: margin={profitable[0]['net']}%")
                 else:
                     logger.info("No profitable signals")
             except Exception as e:
@@ -386,7 +302,7 @@ async def main():
     if not TOKEN:
         logger.error("ARB_BOT_TOKEN не установлен!")
         return
-    logger.info("ArbBybitBinanceBOT запущен")
+    logger.info("BuyerSearch-USDT-KZT-Bot запущен | Binance P2P | KZT")
     connector = aiohttp.TCPConnector(ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         await asyncio.gather(
