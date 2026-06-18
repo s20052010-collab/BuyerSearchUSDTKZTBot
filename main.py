@@ -17,7 +17,6 @@ SELLER_MIN_LIMIT_KZT = 10000
 
 BUYER_MIN_TRADES = 30
 BUYER_MIN_COMPLETION = 98.0
-BUYER_MAX_MIN_LIMIT_KZT = 450000
 
 SEEN_DEALS = set()
 
@@ -47,6 +46,7 @@ async def get_updates(session, offset=0):
 
 
 async def binance_buy(session):
+    """Ищем продавца USDT — у кого покупаем"""
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     try:
         async with session.post(url, json={
@@ -85,6 +85,7 @@ async def binance_buy(session):
 
 
 async def binance_sell(session):
+    """Ищем покупателя USDT — кому продаём"""
     url = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
     try:
         async with session.post(url, json={
@@ -112,7 +113,8 @@ async def binance_sell(session):
                 if price <= 0: continue
                 if trades < BUYER_MIN_TRADES: continue
                 if comp < BUYER_MIN_COMPLETION: continue
-                if min_l > BUYER_MAX_MIN_LIMIT_KZT: continue
+                # Лимит покупателя не фильтруем здесь —
+                # проверяем динамически против лимита продавца ниже
                 if not best or price > best[0]:
                     best = (price, min_l, max_l, banks, nick, trades, round(comp, 1))
             return best
@@ -136,10 +138,10 @@ async def scan(session):
     # Общие банки
     common_banks = buy_banks & sell_banks
     if not common_banks:
-        logger.info(f"No common banks. Buy: {buy_banks} Sell: {sell_banks}")
+        logger.info(f"No common banks. Buy: {buy_banks} | Sell: {sell_banks}")
         return []
 
-    # Мин сумма продажи не больше макс суммы покупки
+    # Мин. лимит покупателя не выше макс. лимита продавца
     if sell_min > buy_max:
         logger.info(f"Limit mismatch: sell_min={sell_min} > buy_max={buy_max}")
         return []
@@ -183,11 +185,13 @@ def format_signal(s):
         f"📥 *КУПИТЬ USDT*\n"
         f"   Цена: `{s['buy_price']} KZT`\n"
         f"   Продавец: {s['buy_nick']}\n"
-        f"   ✅ Сделок: {s['buy_trades']} | Рейтинг: {s['buy_comp']}%\n\n"
+        f"   ✅ Сделок: {s['buy_trades']} | Рейтинг: {s['buy_comp']}%\n"
+        f"   Лимит: {s['buy_min']:,.0f} — {s['buy_max']:,.0f} KZT\n\n"
         f"📤 *ПРОДАТЬ USDT*\n"
         f"   Цена: `{s['sell_price']} KZT`\n"
         f"   Покупатель: {s['sell_nick']}\n"
-        f"   ✅ Сделок: {s['sell_trades']} | Рейтинг: {s['sell_comp']}%\n\n"
+        f"   ✅ Сделок: {s['sell_trades']} | Рейтинг: {s['sell_comp']}%\n"
+        f"   Мин. лимит: {s['sell_min']:,.0f} KZT\n\n"
         f"🏦 *Общие банки:* {banks_str}\n"
         f"💰 *Чистая маржа: {s['net']}%*\n"
         f"💵 Прибыль со 100 USDT: ~{profit_100} KZT\n"
@@ -209,7 +213,7 @@ def filters_text():
         f"📤 *ПОКУПАТЕЛИ* (продаём USDT):\n"
         f"   • Сделок: {BUYER_MIN_TRADES}+\n"
         f"   • Рейтинг: {BUYER_MIN_COMPLETION}%+\n"
-        f"   • Мин. лимит не выше: {BUYER_MAX_MIN_LIMIT_KZT:,} KZT\n\n"
+        f"   • Мин. лимит ≤ макс. лимита продавца\n\n"
         f"📊 Площадка: Binance P2P\n"
         f"💱 Валюта: KZT\n"
         f"🏦 Только совпадающие банки\n"
@@ -250,7 +254,8 @@ async def handle_command(session, text, chat_id):
         if not signals:
             await send_message(session,
                 "😔 Нет сигналов.\n"
-                "Либо маржа < 1%, либо банки не совпадают.\n"
+                "Либо маржа < 1%, либо банки не совпадают,\n"
+                "либо лимиты не совместимы.\n\n"
                 "Продолжаю мониторинг каждые 5 минут."
             )
         else:
